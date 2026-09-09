@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
-"""MPS CLI 전용 도커 하네스 -- 두 실험군, 두 회수 절차.
+"""A CLI-only docker harness: two defects, two reclaim procedures.
 
-    --mode delay    종료 지연: terminate_client 가 예산(grace)을 넘겨 멈추는가
-    --mode illegal  이웃 오염: 손대지 않은 이웃이 illegal memory access 로 죽는가
+    --mode delay    reclaim delay: does terminate_client exceed its budget (grace)?
+    --mode illegal  neighbour poisoning: does an untouched neighbour take an
+                    illegal memory access?
 
-    --arm ps_term   대상마다 ps -> terminate_client 를 순차 발행
-    --arm term      terminate_client 만 (ps 없음)
+    --arm ps_term   per target: ps, then terminate_client, issued in sequence
+    --arm term      terminate_client only (no ps)
 
-두 모드는 **모양만** 다르다. 회수 절차는 같은 코드(mpsctl.reclaim)를 쓴다.
-k8s 쪽 대응은 각각:
+The two modes differ **only in shape**. The reclaim procedure is the same code
+(mpscore.reclaim) in both.
 
-    delay   x ps_term/term  <->  trial.py --arm cliterm (CLITERM_PS=1/0)
-    illegal x ps_term/term  <->  bca_many.py --via cli_ps / cli
+The shapes differ because the two defects need different conditions:
 
-모양이 다른 이유는 두 결함의 재현 조건이 다르기 때문이다.
+    delay   : NPROC=1, QUEUE_DEPTH=32, ~4 clients, 2 reclaims.
+              The shape in which the delay reproduced under Kubernetes.
+    illegal : NPROC=8, QUEUE_DEPTH=8, 18 clients, 6 reclaims then 10 more.
+              The shape in which the poisoning reproduced; with few clients the
+              defect does not appear at all.
 
-    delay   : NPROC=1, QUEUE_DEPTH=32, 클라 ~4개, 회수 2건.
-              k8s 에서 지연이 재현된 레시피의 모양이다.
-    illegal : NPROC=8, QUEUE_DEPTH=8, 클라 18개, 1라운드 6건 + 2라운드 10건.
-              k8s 에서 illegal 이 재현된 모양이며, 2라운드에서 터졌다.
-              클라가 적으면 이 결함은 애초에 안 나온다.
-
-이 하네스는 회수 경로에 terminate_client 외에 아무것도 넣지 않는다. 신호를 보내지
-않고, 컨테이너를 죽이지 않고, agent 도 거치지 않는다. 도커가 옮기지 못하는 것은
-libvgpu LD_PRELOAD, TPC MASK_VALUE(PARTITION_PERCENTAGE=25), preStop/term_all 이며,
-여기서 재현되면 그 셋은 용의선상에서 빠진다.
+Nothing but terminate_client touches the tenants. No signals are sent, no
+container is killed, no orchestration agent is involved. What this docker port
+cannot carry over is the vGPU library's LD_PRELOAD, its TPC MASK_VALUE
+(PARTITION_PERCENTAGE=25), and the preStop/term_all signal path -- so a
+reproduction here rules those three out as causes.
 """
 import argparse
 import os
@@ -57,45 +56,47 @@ def main():
     ap.add_argument("--root", default=os.environ.get(
         "DK_ROOT", os.path.join(os.path.dirname(
             os.path.dirname(os.path.abspath(__file__))), "run")),
-        help="MPS 파이프 디렉터리와 로그를 둘 곳. 컨테이너에 마운트된다")
+        help="where the MPS pipe directory and logs live; mounted into the containers")
     ap.add_argument("--steady", type=int, default=30)
     ap.add_argument("--boot", type=int, default=600)
     ap.add_argument("--grace", type=float, default=30.0,
-                    help="CLI 호출 예산. 파드/컨테이너 종료 유예와 맞춘다 -- "
-                         "프로덕션에서 이 시간을 넘기면 상위가 SIGKILL 로 올라간다")
+                    help="per-call CLI budget, matched to the pod/container "
+                         "termination grace period -- past it, production "
+                         "escalates to SIGKILL")
     ap.add_argument("--ksec", default=os.environ.get("KERNEL_SEC", "5"))
     ap.add_argument("--batch", default=os.environ.get("BATCH", "32"))
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--reuse-mps", action="store_true",
-                    help="rep 사이에 MPS 데몬을 유지한다. 누적 효과를 "
-                         "보려면 필요하다 -- 매번 새 데몬이면 각 셀이 "
-                         "깨끗한 상태에서 시작해 누적을 못 잰다")
-    # 모양 오버라이드.
+                    help="keep the MPS daemon alive between reps. Needed to see "
+                         "cumulative effects -- with a fresh daemon each cell "
+                         "starts clean and nothing can accumulate")
+    # Shape overrides.
     #
-    # peer 세션이 도커에서 40 클라 순차 종료의 **40번째**에서 CLI 가 5시간 무한
-    # 대기하는 것을 잡았다(worker thread = __skb_wait_for_more_packets, 약 1/6).
-    # c1~c39 는 19~394ms 로 정상이었다. 즉 이 결함은 회수 건수가 쌓여야 나온다.
-    # 기본 모양(회수 2건/6건)으로는 검정력이 없다.
+    # A CLI hang was caught on the **40th** of 40 sequential reclaims, blocked for
+    # five hours (worker thread in __skb_wait_for_more_packets), roughly 1 in 6
+    # trials; c1-c39 had returned normally in 19-394 ms. So that defect needs the
+    # reclaim count to build up, and the default shapes (2 or 6 reclaims) have no
+    # power to detect it.
     ap.add_argument("--noff", type=int)
     ap.add_argument("--nvic", type=int)
     ap.add_argument("--nproc", type=int)
     ap.add_argument("--kill", type=int)
     ap.add_argument("--qdepth")
     ap.add_argument("--off-libvgpu",
-                    help="오펜더에 얹을 block_gpu 설정 디렉터리. TPC 마스크로 "
-                         "오펜더의 SM 점유를 가둬 이웃 정지를 막는다")
+                    help="block_gpu config directory to layer onto the offenders; "
+                         "its TPC mask caps their SM footprint and prevents the "
+                         "neighbour stall")
     ap.add_argument("--off-pct", default="25",
-                    help="오펜더의 CUDA_MPS_ACTIVE_THREAD_PERCENTAGE. "
-                         "k8s 의 TPC 마스크(25%%)를 근사한다. 없으면 "
-                         "victim 이 굶어 첫 스텝도 못 찍는다")
+                    help="CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for the offenders, "
+                         "approximating the Kubernetes TPC mask (25%%)")
     ap.add_argument("--min-step", type=int, default=200,
-                    help="발사 전 victim 이 도달해야 하는 최소 step")
+                    help="minimum step the victims must reach before firing")
     ap.add_argument("--vready", type=int, default=300,
-                    help="victim 준비 대기 상한(초)")
+                    help="how long to wait for victim readiness, in seconds")
     a = ap.parse_args()
 
     if not a.gpu_uuid:
-        say("GPU_UUID 를 주세요 (--gpu-uuid 또는 환경변수)")
+        say("need a GPU UUID (--gpu-uuid, or the GPU_UUID environment variable)")
         return 2
 
     shape = dict(SHAPES[a.mode])
@@ -116,32 +117,35 @@ def main():
     say("mode=%s arm=%s seq=%d shape=%s" % (a.mode, a.arm, a.seq, shape))
     fleet.clean(keep_mps=a.reuse_mps)
     fleet.start_mps(reuse=a.reuse_mps)
-    # 1) victim 만 먼저 띄우고, 정상 속도에 들 때까지 기다린다.
+
+    # 1) Bring the victims up alone and wait until they are training.
     fleet.start_victims(shape["nvic"], a.batch)
     if not fleet.wait_victims_ready(min_step=a.min_step, timeout=a.vready):
-        say("VOID: 오펜더 없이도 victim 이 step>=%d 에 못 감 -- 하네스 문제"
-            % a.min_step)
+        say("VOID: victims never reached step>=%d even with no offenders present "
+            "-- this is a harness problem, not a result" % a.min_step)
         if not a.keep:
             fleet.clean(keep_mps=a.reuse_mps)
         return 2
-    say("--- 오펜더 기동 전 victim 상태 ---")
-    fleet.victim_progress("오펜더전")
+    say("--- victim state before the offenders start ---")
+    fleet.victim_progress("pre-offender")
 
-    # 2) 그 다음 오펜더를 붙인다. 여기서 victim 이 멈추는지가 핵심 관측이다.
-    #    MPS 는 SM 할당량 초과 시 시분할로 전환되므로, 단순 경쟁이라면 느려질
-    #    뿐 0 이 되지는 않는다. 0 이 되면 그것은 경쟁이 아니라 디스패치 정지다.
+    # 2) Now attach the offenders. Whether the victims stop here is the key
+    #    observation: MPS time-slices past its SM budget, so plain contention
+    #    slows a tenant but does not take it to zero. Zero is a dispatch stall,
+    #    not contention.
     fleet.start_offenders(shape["noff"], shape["nproc"], shape["qdepth"], a.ksec)
 
     want = shape["noff"] * shape["nproc"] + shape["nvic"]
     pids = fleet.wait_clients(cli, want, boot=a.boot)
-    say("--- 오펜더 기동 후 victim 상태 (회수 전) ---")
-    live_after_off = fleet.victim_progress("오펜더후")
+    say("--- victim state after the offenders started (before any reclaim) ---")
+    live_after_off = fleet.victim_progress("post-offender")
     if not live_after_off:
-        say("주의: 회수를 하기도 전에 victim 이 멈췄다. "
-            "이 셀의 전파 판정은 성립하지 않는다 -- 오펜더 기동만으로 정지한 것이다.")
+        say("WARNING: the victims stopped before anything was reclaimed. "
+            "This cell cannot testify to propagation -- attaching the offenders "
+            "alone was enough to stall them.")
     if len(pids) < want:
-        say("VOID: 클라 %d개 < 기대 %d -- 붙지 않은 클라는 살아남은 방관자가 아니다"
-            % (len(pids), want))
+        say("VOID: %d clients < %d expected -- a client that never attached is "
+            "not a bystander that survived" % (len(pids), want))
         if not a.keep:
             fleet.clean(keep_mps=a.reuse_mps)
         return 2
@@ -149,73 +153,75 @@ def main():
     owner = fleet.owner_map(pids)
     off_pids = [p for p in pids if owner.get(p) in fleet.off]
     vic_pids = [p for p in pids if owner.get(p) in fleet.vic]
-    say("소유: 오펜더 %d / victim %d / 미분류 %d"
+    say("ownership: offender %d / victim %d / unmapped %d"
         % (len(off_pids), len(vic_pids), len(pids) - len(off_pids) - len(vic_pids)))
 
     kill = shape["kill"] or len(off_pids)
     if len(off_pids) < kill:
-        say("VOID: 오펜더 클라 %d개 < 회수 대상 %d" % (len(off_pids), kill))
+        say("VOID: %d offender clients < %d to reclaim" % (len(off_pids), kill))
         if not a.keep:
             fleet.clean(keep_mps=a.reuse_mps)
         return 2
 
-    say("정상 상태 %ds" % a.steady)
+    say("steady state for %ds" % a.steady)
     time.sleep(a.steady)
     srv = cli.server()
     if srv is None:
-        # srv 없이 쏘면 CLI 가 None 을 0 으로 읽어 "Server 0 not found" 를 찍는다.
-        # 발행은 한 건도 안 됐는데 성공처럼 기록되므로 여기서 멈춘다.
-        say("VOID: get_server_list 가 서버 pid 를 못 줌 -- 발행 0건")
+        # Firing without a server pid makes the CLI read None as 0 and print
+        # "Server 0 not found": nothing is issued, yet it records as if it were.
+        say("VOID: get_server_list returned no server pid -- nothing issued")
         if not a.keep:
             fleet.clean(keep_mps=a.reuse_mps)
         return 2
     say("server=%s" % srv)
 
-    # 회수 대상은 **한 오펜더 컨테이너 안에서만** 고른다.
+    # Pick the reclaim targets from **one offender container only**.
     #
-    # 그냥 off_pids[:kill] 로 자르면 대상이 두 오펜더 컨테이너에 걸치고, 그러면
-    # 손대지 않은 오펜더가 하나도 안 남는다. 남는 이웃이 ResNet victim 뿐인데
-    # victim 은 오펜더 부착만으로 멈추므로 셀이 자동으로 VOID 가 된다
-    # (실측: rep2~5 가 전부 "진행 중 0/2" 로 무효였고, 이전 캠페인의 게이트
-    # 통과율 7/12 도 같은 이유였다).
+    # Slicing off_pids[:kill] lets the targets span both offender containers, and
+    # then no untouched offender is left. The only remaining neighbours are the
+    # ResNet victims -- which stall as soon as the offenders attach -- so the
+    # cell voids itself (measured: reps 2-5 all came out "0/2 progressing", and
+    # an earlier campaign's 7/12 gate-pass rate had the same cause).
     #
-    # 한 컨테이너에서만 뽑으면 나머지 오펜더 컨테이너가 항상 이웃으로 남는다.
+    # Taking them from a single container always leaves the other one as a
+    # neighbour that is still running.
     by_ctr = {}
     for p_ in off_pids:
         by_ctr.setdefault(owner[p_], []).append(p_)
     src = max(by_ctr, key=lambda c: len(by_ctr[c])) if by_ctr else None
     if src and len(by_ctr[src]) >= kill:
         targets = by_ctr[src][:kill]
-        say("회수 대상은 %s 에서만 %d개 (이웃으로 %s 남김)"
-            % (src, kill, ", ".join(c for c in by_ctr if c != src) or "없음"))
+        say("reclaiming %d targets from %s only (leaving %s as neighbours)"
+            % (kill, src, ", ".join(c for c in by_ctr if c != src) or "none"))
     else:
         targets = off_pids[:kill]
-        say("주의: 한 컨테이너에서 %d개를 못 채워 여러 컨테이너에 걸침 "
-            "-- 손대지 않은 오펜더가 안 남을 수 있음" % kill)
+        say("WARNING: could not take %d targets from one container, so they span "
+            "several -- no untouched offender may be left" % kill)
     touched = {owner[p] for p in targets}
-    # 손대지 않은 컨테이너 **전부**의 진행을 본다. victim 만 보면, victim 이
-    # 정지한 셀에서 손대지 않은 오펜더가 illegal 을 맞은 사실을 놓친다.
+
+    # Check **every** untouched container for progress. Watching only the victims
+    # loses the case where an untouched offender was poisoned while running.
     untouched_all = [n for n in fleet.off + fleet.vic if n not in touched]
-    say("--- 발사 전 손대지 않은 컨테이너 진행 확인 ---")
-    live_map = fleet.progress(untouched_all, "발사전")
+    say("--- progress of untouched containers, just before firing ---")
+    live_map = fleet.progress(untouched_all, "pre-fire")
     live = all(live_map.get(v, False) for v in fleet.vic if v in untouched_all)
-    live_any = any(live_map.values())
-    say("  발사전 요약: 진행 중 %d / %d  (victim 전부 진행=%d)"
+    say("  pre-fire summary: %d of %d progressing (all victims progressing=%d)"
         % (sum(1 for x in live_map.values() if x), len(live_map), int(live)))
 
-    r1 = reclaim(cli, targets, a.arm, "1라운드", say, srv=srv)
+    r1 = reclaim(cli, targets, a.arm, "round1", say, srv=srv)
     if r1["ok"] == 0:
-        say("VOID 대상 %d개 중 성공(rc=0) 0건" % len(targets))
+        say("VOID: none of the %d targets returned rc=0" % len(targets))
 
-    say("관측 %ds" % shape["observe"])
+    say("observing for %ds" % shape["observe"])
     time.sleep(shape["observe"])
-    say("--- 손대지 않은 컨테이너 ---")
-    nerr, nill = fleet.score(untouched_all, "1라운드")
-    # 진행 중이던 이웃만 따로 센다. 이것이 전파의 증거가 되는 집합이다.
+    say("--- untouched containers ---")
+    nerr, nill = fleet.score(untouched_all, "round1")
+    # Score the neighbours that were progressing separately: that set is the
+    # evidence for propagation.
     live_names = [n for n, ok in live_map.items() if ok]
     lerr, lill = (0, 0)
     if live_names:
-        lerr, lill = fleet.score(live_names, "1라운드(진행중이던 이웃만)")
+        lerr, lill = fleet.score(live_names, "round1 (progressing neighbours only)")
     _, after = cli.ps(label="after")
     over = [c for c in cli.calls
             if c["verb"] == "terminate_client" and c["elapsed_s"] >= a.grace * 0.5]
@@ -227,20 +233,21 @@ def main():
            len(live_names), lerr, lill,
            nerr, nill, r1["worst_term_s"], r1["worst_ps_s"], len(over), len(after)))
 
-    # illegal 모드만 2라운드를 돈다. victim 을 빼고 남은 것만 회수해야
-    # victim 사망이 전파인지 자기 회수인지 갈린다.
+    # Only the illegal mode runs a second round. The victims are held back and
+    # reclaimed last, otherwise a victim's death cannot be separated from its own
+    # intended reclaim.
     if a.mode == "illegal":
         _, rest = cli.ps(label="round2")
         oth = [p for p in rest if owner.get(p) not in fleet.vic]
         vic_left = [p for p in rest if owner.get(p) in fleet.vic]
-        say("정리 분할: 비-victim %d개 / victim %d개" % (len(oth), len(vic_left)))
+        say("remaining split: %d non-victim / %d victim" % (len(oth), len(vic_left)))
         if oth:
-            say("--- 2라운드 발사 전 victim 진행 확인 ---")
-            live2 = fleet.victim_progress("2라운드전")
-            r2 = reclaim(cli, oth, a.arm, "2라운드", say, srv=srv)
-            say("관측 %ds" % shape["cleanup_observe"])
+            say("--- victim progress before round 2 ---")
+            live2 = fleet.victim_progress("pre-round2")
+            r2 = reclaim(cli, oth, a.arm, "round2", say, srv=srv)
+            say("observing for %ds" % shape["cleanup_observe"])
             time.sleep(shape["cleanup_observe"])
-            aerr, aill = fleet.score(fleet.vic, "2라운드")
+            aerr, aill = fleet.score(fleet.vic, "round2")
             _, after2 = cli.ps(label="after2")
             say("RESULT_R2 dkcli mode=%s arm=%s seq=%d reclaimed=%d ok=%d "
                 "victim_live_before=%d victim_with_error=%d illegal=%d "
@@ -248,19 +255,19 @@ def main():
                 % (a.mode, a.arm, a.seq, len(oth), r2["ok"], int(live2),
                    aerr, aill, r2["worst_term_s"], len(after2)))
         if vic_left:
-            reclaim(cli, vic_left, a.arm, "정리(victim)", say, srv=srv)
+            reclaim(cli, vic_left, a.arm, "cleanup(victim)", say, srv=srv)
 
-    # 호출 요약 -- 지연 판정의 근거
+    # Call summary -- the basis for any delay verdict.
     verbs = {}
     for c in cli.calls:
         verbs.setdefault(c["verb"], []).append(c["elapsed_s"])
     for v in sorted(verbs):
         xs = sorted(verbs[v])
-        say("호출 %-18s n=%3d 중앙 %.4fs 최대 %.4fs"
+        say("calls %-18s n=%3d median %.4fs max %.4fs"
             % (v, len(xs), xs[len(xs) // 2], xs[-1]))
 
     if not a.keep:
-        say("컨테이너 정리")
+        say("removing containers")
         fleet.clean(keep_mps=a.reuse_mps)
     return 0
 

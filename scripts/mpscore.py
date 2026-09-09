@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
-"""MPS control CLI 코어 -- 두 실험군, 두 플랫폼이 **이 파일 하나**를 공유한다.
+"""The MPS control CLI core. Every harness in this family issues through here.
 
-지연군(trial.py)과 illegal군(bca_many.py), k8s 와 도커가 각자 CLI 를 부르던 것을
-여기로 모았다. 이유는 단순하다: 같은 절차를 두 번 구현하면 한쪽에서 고친 계측
-함정이 다른 쪽에 안 들어간다. 실제로 발행 인터리빙이 두 하네스에서 달랐다.
+Two defects (reclaim delay, neighbour poisoning) and two platforms (Kubernetes,
+docker) used to call the CLI from four different places. They were merged into
+this one file for a simple reason: implement the same procedure twice and a
+measurement trap fixed on one side does not reach the other. That happened --
+the two harnesses interleaved their calls differently, and only one of them was
+correct.
 
-**부르는 방식은 여기서 하나로 고정된다.**
+**The issuing procedure is fixed here.**
 
-    발행 = 단일 시퀀스. 대상마다  ps -> terminate_client  를 순서대로.
-           한 대상의 (ps, terminate) 쌍 사이에 다른 호출이 끼지 않는다.
-           시퀀스 전체를 락 한 번으로 감싸므로, 동시에 발화한 스레드가 있어도
-           파드/컨테이너 단위로 줄을 선다.
+    One sequence. For each target: ps -> terminate_client, in order.
+    No other call is interleaved between a target's (ps, terminate) pair,
+    because the whole sequence is wrapped in a single lock acquisition. Threads
+    that fire simultaneously therefore queue at pod/container granularity.
 
-**바뀌지 않는 것**: 무엇을 에러로 볼지, 어떤 모양으로 돌지는 실험군마다 다르다.
-그건 호출자(trial.py / bca_many.py / run_probe.py)가 정한다.
+**What is NOT fixed here**: what counts as an error, and what shape to run. That
+belongs to the caller, and it differs per defect.
 
-여기 박아 둔 규칙은 전부 한 번씩 틀려 본 것들이다.
+Every rule below was learned by getting it wrong first.
 
-1. **순차 호출.** MPS control 데몬은 커넥션을 하나만 받는다. 동시에 부르면 큐에
-   서는 게 아니라 "Cannot send command" 로 거절당하고, 호출자는 아무 일도 안 한 채
-   1ms 만에 돌아온다. 락은 파일 락이다 -- 데몬은 노드 전체 공유라 스레드 락으로는
-   다른 프로세스를 못 막는다(실측: 캠페인 2개가 싸워 거절 7건).
-2. **응답 분류.** 성공은 "0" 뿐. 201=CUDA_ERROR_INVALID_CONTEXT,
-   "Invalid process <pid>!", "Server 0 not found", "Cannot send command" 는
-   전부 회수가 아니다(실측: 99건 중 73건만 실제 회수였다).
-3. **ps 와 terminate 를 따로, 대기와 실행을 따로 잰다.** 합치면 멈춘 쪽을 지목할 수
-   없고, 락 대기를 terminate 소요시간으로 오독한다.
-4. **srv 를 못 얻으면 발행하지 않는다.** 그대로 쏘면 CLI 가 None 을 0 으로 읽어
-   "Server 0 not found" 를 찍는데, 발행은 한 건도 안 됐으면서 기록엔 남는다.
+1. **Issue sequentially.** The MPS control daemon accepts one connection at a
+   time. Concurrent callers are not queued -- they are refused with "Cannot send
+   command to MPS control daemon process" in about a millisecond, having done
+   nothing. The lock is a *file* lock: the daemon is shared node-wide, so a
+   thread lock cannot exclude another process (measured: two campaigns fighting
+   produced 7 refusals).
+2. **Classify every response.** Only "0" is success.
+   201 = CUDA_ERROR_INVALID_CONTEXT, "Invalid process <pid>!",
+   "Server 0 not found" and "Cannot send command" are all *not* reclaims
+   (measured: only 73 of 99 responses were genuine reclaims).
+3. **Time ps and terminate separately, and waiting separately from running.**
+   Merge them and you cannot say which one stalled, and lock waiting gets
+   misread as terminate duration.
+4. **Do not issue if the server pid is unknown.** Passing None makes the CLI
+   read it as 0 and print "Server 0 not found" -- nothing was issued, yet it
+   lands in the record as if something was.
 """
 import contextlib
 import csv
@@ -42,11 +50,11 @@ LOCK_DIR = os.environ.get("MPS_LOCK_DIR", "/var/lock")
 
 @contextlib.contextmanager
 def cli_lock(key, timeout=120.0, poll=0.01):
-    """데몬(=GPU) 별 파일 락. 예산 안에 못 잡으면 held=False 로 알린다.
+    """Per-daemon (per-GPU) file lock. Reports held=False if not acquired in time.
 
-    무한정 기다리지 않는 이유: 락을 쥔 쪽이 멈추면 실험이 통째로 멈춘다.
-    못 잡았다는 사실은 반드시 기록에 남긴다 -- 조용히 넘어가면 거절이 다시
-    데이터에 섞인다.
+    It does not wait forever on purpose: if whoever holds the lock is stuck, the
+    whole experiment stops. Failing to acquire must be recorded -- swallow it
+    silently and refusals leak back into the data.
     """
     path = os.path.join(LOCK_DIR, "mpsctl_%s.lock" % key)
     fd, held = None, False
@@ -87,8 +95,8 @@ def classify(resp):
     if t == "<TIMEOUT>":
         return "timeout"
     if t == "<NO_TERM>":
-        # arm="ps" 는 terminate 를 아예 발행하지 않는다. 실패가 아니라
-        # "쏘지 않았다"이므로 성공/실패 어느 쪽으로도 세면 안 된다.
+        # arm="ps" never issues a terminate at all. That is not a failure, it is
+        # "did not fire", so it must count as neither success nor failure.
         return "noop"
     if t == "":
         return "empty"
@@ -107,19 +115,20 @@ def parse_ps(out):
 
 
 class MpsCli(object):
-    """CLI 한 건을 쏘고 재고 기록한다. 전송 방식은 둘 중 하나다.
+    """Issues one CLI call, times it, records it. Two transports:
 
-        pipe_dir=... : 호스트에서 직접 (k8s 블록 MPS)
-        container=...: docker exec 로 (도커의 사설 MPS)
+        pipe_dir=... : directly on the host (a Kubernetes block MPS daemon)
+        container=...: through `docker exec` (docker's private MPS daemon)
 
-    budget 은 파드/컨테이너의 종료 유예(grace)와 맞춘다. 프로덕션에서 의미 있는
-    경계가 그것이기 때문이다 -- 그 안에 종료가 안 끝나면 상위가 SIGKILL 로
-    올라가고, 상주 큐를 쥔 클라를 SIGKILL 하면 이웃이 오염된다.
+    `budget` is matched to the pod/container termination grace period, because
+    that is the boundary that means something in production: if a reclaim has
+    not finished within it, the layer above escalates to SIGKILL, and SIGKILL on
+    a client holding a resident queue poisons its neighbours.
     """
 
     def __init__(self, lock_key, pipe_dir=None, container=None,
                  csv_path=None, budget=30.0, run_id=""):
-        assert pipe_dir or container, "pipe_dir 또는 container 가 필요합니다"
+        assert pipe_dir or container, "need either pipe_dir or container"
         self.lock_key = lock_key
         self.pipe_dir = pipe_dir
         self.container = container
@@ -172,7 +181,7 @@ class MpsCli(object):
         return rec
 
     def one(self, cmd, label="", note=""):
-        """락을 직접 잡고 한 건만 쏜다 (시퀀스 밖의 단발 호출용)."""
+        """Take the lock and issue a single call (for one-offs outside a sequence)."""
         tw = time.time()
         with cli_lock(self.lock_key, timeout=self.budget * 4) as held:
             wait_s = time.time() - tw
@@ -190,35 +199,38 @@ class MpsCli(object):
 
 
 def reclaim(cli, pids, arm, label, say, srv=None, verify_after=True):
-    """회수 시퀀스 -- 두 실험군이 공유하는 **유일한** 발행 경로.
+    """The reclaim sequence -- the single issuing path shared by every harness.
 
-        arm="ps_term"  대상마다 ps 로 명부를 확인한 뒤 terminate_client
-        arm="term"     terminate_client 만
-        arm="ps"       ps 만. terminate 는 발행하지 않는다.
+        arm="ps_term"  per target: ps to read the client table, then terminate_client
+        arm="term"     per target: terminate_client only
+        arm="ps"       per target: ps only, no terminate at all
 
-    세 arm 은 "mps ps + terminate_client 조합이 문제"라는 가설의 3분해다.
-    ps 만 돌려도 같은 증상이 나오면 terminate 는 재료가 아니고, terminate 만
-    돌려도 나오면 ps 가 재료가 아니며, 둘 다 아닌데 조합에서만 나오면 조합이다.
-    arm="ps" 는 회수가 0건이므로 "성공 0건 -> VOID" 규칙을 그대로 적용하면 안 된다
-    -- 호출자가 이 arm 을 대조군으로 따로 다뤄야 한다.
+    The three arms decompose the hypothesis "it is the combination of mps ps and
+    terminate_client". If ps alone shows the symptom, terminate is not an
+    ingredient; if terminate alone shows it, ps is not; if neither does but the
+    pair does, it is the combination. Note that arm="ps" reclaims nothing, so the
+    caller must NOT apply the usual "zero successes -> VOID" rule to it: it is a
+    control, not a failed cell.
 
-    시퀀스 전체를 락 한 번으로 감싼다. 그래야 한 대상의 (ps, terminate) 쌍 사이에
-    다른 스레드의 호출이 끼지 않는다. 쌍이 섞이면 그 사이에 대상 상태가 바뀌어,
-    지연을 재는 실험에서 무시할 수 없는 차이가 된다.
+    The whole sequence is wrapped in one lock acquisition so that no other
+    thread's call lands between a target's ps and its terminate. If the pairs
+    interleave, the target's state can change in between -- not a difference you
+    can ignore when the thing being measured is latency.
     """
     assert arm in ("ps_term", "term", "ps"), arm
-    say("--- %s: %d개 (arm=%s) ---" % (label, len(pids), arm))
+    say("--- %s: %d targets (arm=%s) ---" % (label, len(pids), arm))
     res, tw = [], time.time()
     with cli_lock(cli.lock_key, timeout=cli.budget * 8) as held:
         seq_wait = time.time() - tw
         if not held:
-            say("  주의: 락을 예산 안에 못 잡음 -- 거절될 수 있음")
+            say("  WARNING: lock not acquired within budget -- calls may be refused")
         if srv is None:
             el, out = cli._run("get_server_list")
             cli._record("get_server_list", el, out, label, "", 0.0, held)
             srv = next((t for t in out.split() if t.isdigit()), None)
         if srv is None:
-            say("VOID %s: get_server_list 가 서버 pid 를 못 줌 -- 발행 0건" % label)
+            say("VOID %s: get_server_list returned no server pid -- nothing issued"
+                % label)
             return {"res": [], "counts": {}, "ok": 0, "srv": None,
                     "worst_term_s": 0.0, "worst_ps_s": 0.0, "seq_wait_s": seq_wait}
         for pid in pids:
@@ -226,27 +238,28 @@ def reclaim(cli, pids, arm, label, say, srv=None, verify_after=True):
             if arm in ("ps_term", "ps"):
                 ps_el, ps_out = cli._run("ps")
                 seen = parse_ps(ps_out)
-                # 대상이 명부에 없는데 쏘면 그건 유령 회수다. 기록에 남겨야
-                # "회수했다"로 오독하지 않는다.
+                # If the target is not in the table and we fire anyway, that is a
+                # reclaim of a ghost. Record it, or it reads later as a real one.
                 note = "n=%d tgt=%d" % (len(seen), 1 if pid in seen else 0)
                 cli._record("ps", ps_el, ps_out, label + ":ps", note, 0.0, held)
             if arm == "ps":
-                # 대조군: 호출 횟수와 발행 리듬은 ps_term 과 같게 두고
-                # terminate 만 뺀다.
+                # Control arm: same call count and same rhythm as ps_term, with
+                # only the terminate removed.
                 el, out = 0.0, "<NO_TERM>"
             else:
                 cmd = "terminate_client %s %s" % (srv, pid)
                 el, out = cli._run(cmd)
                 cli._record(cmd, el, out, label + ":term", note, 0.0, held)
-            # 종료 직후 대상이 실제로 사라졌는지 확인한다.
+            # Check whether the target actually disappeared.
             #
-            # 가설: 201(CUDA_ERROR_INVALID_CONTEXT)은 **엉뚱한 컨텍스트를 지목해
-            # 종료한 것**이고, 그래서 (a) 진짜 대상은 살아남고 (b) 애먼 컨텍스트가
-            # 무너져 이웃 오염으로 나타난다. 맞다면 201 직후 ps 에 대상 pid 가
-            # **그대로 남아 있어야** 한다.
+            # Hypothesis under test: 201 (CUDA_ERROR_INVALID_CONTEXT) means the
+            # daemon named the *wrong* context, so (a) the real target survives
+            # and (b) some innocent context is torn down instead, which is what
+            # surfaces as neighbour poisoning. If that were so, the target pid
+            # would still be in `ps` right after a 201.
             #
-            # 성공(rc=0) 응답에도 같은 확인을 한다. "0 을 받았는데 안 죽었다"가
-            # 있는지가 이 가설의 대조군이다.
+            # The same check runs on successful (rc=0) responses too: "got 0 but
+            # it did not die" is the control for this hypothesis.
             post = ""
             if verify_after:
                 _pel, pout = cli._run("ps")
@@ -264,15 +277,16 @@ def reclaim(cli, pids, arm, label, say, srv=None, verify_after=True):
     for r in res:
         k = classify(r[2])
         counts[k] = counts.get(k, 0) + 1
-    say("%s 응답: %s" % (label, " ".join("%s=%d" % kv for kv in sorted(counts.items()))))
+    say("%s responses: %s"
+        % (label, " ".join("%s=%d" % kv for kv in sorted(counts.items()))))
     ok = [r for r in res if classify(r[2]) == "ok"]
     worst_term = max((r[1] for r in ok), default=0.0)
     worst_ps = max((r[3] for r in res), default=0.0)
     survived = [r for r in res if str(r[4]).endswith("after_tgt=1")]
-    say("%s worst_term=%.3fs worst_ps=%.3fs seq_wait=%.3fs (성공 %d/%d, 종료후 잔존 %d)"
+    say("%s worst_term=%.3fs worst_ps=%.3fs seq_wait=%.3fs (ok %d/%d, still present %d)"
         % (label, worst_term, worst_ps, seq_wait, len(ok), len(res), len(survived)))
     for r in survived:
-        say("  ! 응답=%s 인데 pid=%d 가 ps 에 그대로 남음" % (classify(r[2]), r[0]))
+        say("  ! response=%s but pid=%d is still in ps" % (classify(r[2]), r[0]))
     return {"res": res, "counts": counts, "ok": len(ok), "srv": srv,
             "worst_term_s": worst_term, "worst_ps_s": worst_ps,
             "seq_wait_s": seq_wait, "survived": len(survived)}

@@ -23,7 +23,7 @@ ART_DIR = os.environ.get("ART_DIR", "/artifacts")
 # The kernel: every thread busy-waits on the SM clock until `cycles` have
 # elapsed.  A single launch therefore occupies its TPCs for a controllable
 # wall-clock duration (we target ~5s, matching the earlier experiment's
-# "5초 커널").  `flag` lets the host observe that it really ran, and
+# a "5-second kernel").  `flag` lets the host observe that it really ran, and
 # `abort_flag` (a mapped host word) lets us cut a spin short if we ever need
 # to; it is never written during the experiment itself.
 KERNEL_SRC = r"""

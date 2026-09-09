@@ -19,7 +19,7 @@ tenants untouched. The line that matters:
 
 ```
 RESULT ... live_neighbors=1 live_with_error=1 live_illegal=1
-  1라운드 dkill_o2: CUDA error: an illegal memory access was encountered
+  round1 dkill_o2: CUDA error: an illegal memory access was encountered
 ```
 
 `live_*` counts **only neighbours that were still making progress when the
@@ -58,8 +58,8 @@ reason to suspect the answer is no, since **4 clients suffice there**.
 ## What it reports
 
 ```
-발사전 dkill_o2: prog=4 (+1 in 5s)          <- neighbour was running when we fired
-발사전 dkill_v1: step=1330 (+0 in 5s)       <- this one was not; it cannot testify
+pre-fire dkill_o2: prog=4 (+1 in 5s)        <- neighbour was running when we fired
+pre-fire dkill_v1: prog=1330 (+0 in 5s)     <- this one was not; it cannot testify
 
 RESULT dkcli mode=illegal arm=ps_term clients=18 killed=6 ok=6
        live_neighbors=1 live_with_error=1 live_illegal=1
@@ -127,20 +127,21 @@ Never conclude from the exit code alone.
   destroy the very state under test.
 * **The readiness gate matters.** MPS has a client limit (48 on Volta+ by
   default). A client that never attached is not a bystander that survived, so a
-  cell where fewer than `NCLIENT` clients attached is VOID, not a clean result.
+  cell where fewer clients attached than requested is VOID, not a clean result.
   If you are probing near the limit, that gate is the difference between a
   finding and an artefact.
 
 ## Status
 
-**The earlier sweep results are void, and the harness that produced them had a
-defect.** `run_many.sh` referenced the ResNet victims in its readiness gate, its
-cleanup and its scoring — `v$i.log`, `VPID` — but **never launched them**. Every
-"no damage at 40 clients" cell from that version therefore ran with queuefill
-neighbours only: the tolerant side, which this README already says will report no
-damage almost regardless. Those cells measured nothing. Fixed here by adding the
-victim launch block (victims start first, since ResNet takes tens of seconds to
-settle).
+**An earlier version of this harness never launched the ResNet victims at all.**
+It referenced them in its readiness gate, its cleanup and its scoring, but no
+code started them. Every "no damage at 40 clients" cell from that version
+therefore ran with queuefill neighbours only: the tolerant side, which this
+README already says will report no damage almost regardless. Those cells
+measured nothing, and their results are void.
+
+The harness here starts the victims first and waits until they are training
+before anything else comes up.
 
 What is established at the time of writing, with the fixed harness and a readiness
 gate applied to **every untouched neighbour**:
