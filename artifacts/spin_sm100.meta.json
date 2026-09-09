@@ -1,0 +1,13 @@
+{
+  "built_at": "2026-09-01T09:44:05+0000",
+  "device_name": "NVIDIA B200",
+  "compute_capability": "10.0",
+  "artifact": "spin_sm100.cubin",
+  "artifact_kind": "cubin",
+  "artifact_bytes": 6032,
+  "artifact_sha256": "6b1c107ff71a6b526cf33bcf85d1adee333c77e5992913d90a903e937613fa22",
+  "nvrtc_path": "/opt/conda/lib/python3.1/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12",
+  "nvrtc_version": "12.8",
+  "torch": "2.7.1+cu128",
+  "source_sha256": "e51761250b7d4b321b438b921ed770a0b663eb690437169baede590387baf02b"
+}

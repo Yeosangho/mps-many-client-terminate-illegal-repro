@@ -1,0 +1,9 @@
+# 실행 산출물
+run/
+out/
+out_*/
+runs/
+*.log
+!evidence/*.log
+__pycache__/
+*.pyc
